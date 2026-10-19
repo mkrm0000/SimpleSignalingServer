@@ -36,7 +36,6 @@ var (
 	rooms   = make(map[string]*Room)
 	roomsMu sync.RWMutex
 
-	// Stats counters
 	startTime     = time.Now()
 	totalConns    int64
 	totalMessages int64
@@ -66,6 +65,12 @@ func (r *Room) remove(c *Client) {
 	delete(r.clients, c)
 }
 
+func (r *Room) count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.clients)
+}
+
 func (r *Room) broadcastExcept(sender *Client, msg []byte) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -79,7 +84,6 @@ func (r *Room) broadcastExcept(sender *Client, msg []byte) {
 	}
 }
 
-// cleanupEmptyRooms removes rooms with zero clients
 func cleanupEmptyRooms() {
 	roomsMu.Lock()
 	defer roomsMu.Unlock()
@@ -143,8 +147,30 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		case "join":
 			client.room = msg.Room
 			room := getOrCreateRoom(msg.Room)
+
+			// Snapshot existing count BEFORE adding this client,
+			// so the first arrival is deterministically host.
+			existing := room.count()
+
 			room.add(client)
-			log.Printf("Client joined room: %s", msg.Room)
+
+			role := "guest"
+			if existing == 0 {
+				role = "host"
+			}
+
+			roleMsg, _ := json.Marshal(map[string]string{
+				"type": "role",
+				"role": role,
+				"room": msg.Room,
+			})
+			select {
+			case client.send <- roleMsg:
+			default:
+			}
+
+			log.Printf("Client joined room %q as %s (%d existing)", msg.Room, role, existing)
+
 		case "offer", "answer", "ice":
 			if client.room != "" {
 				room := getOrCreateRoom(client.room)
@@ -154,22 +180,20 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// statsHandler returns JSON stats
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	roomsMu.RLock()
 	roomCount := len(rooms)
-	roomsMu.RUnlock()
 
-	roomsMu.RLock()
 	type RoomInfo struct {
 		ID      string `json:"id"`
 		Clients int    `json:"clients"`
 	}
 	roomList := make([]RoomInfo, 0, len(rooms))
+	liveClients := 0
 	for id, rm := range rooms {
-		rm.mu.RLock()
-		roomList = append(roomList, RoomInfo{ID: id, Clients: len(rm.clients)})
-		rm.mu.RUnlock()
+		n := rm.count()
+		liveClients += n
+		roomList = append(roomList, RoomInfo{ID: id, Clients: n})
 	}
 	roomsMu.RUnlock()
 
@@ -177,16 +201,6 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	conns := totalConns
 	msgs := totalMessages
 	statsMu.Unlock()
-
-	// Count live WebSocket clients
-	var liveClients int
-	roomsMu.RLock()
-	for _, rm := range rooms {
-		rm.mu.RLock()
-		liveClients += len(rm.clients)
-		rm.mu.RUnlock()
-	}
-	roomsMu.RUnlock()
 
 	resp := map[string]interface{}{
 		"uptime_seconds": int(time.Since(startTime).Seconds()),
@@ -203,7 +217,6 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// Serve the dashboard at /
 const dashboardHTML = `<!DOCTYPE html>
 <html>
 <head>
@@ -234,22 +247,18 @@ const dashboardHTML = `<!DOCTYPE html>
   <div class="card"><div class="label">Total Conns</div><div class="value" id="conns">–</div></div>
   <div class="card"><div class="label">Total Messages</div><div class="value" id="msgs">–</div></div>
 </div>
-
 <h3 style="font-size:14px;color:#8b949e;text-transform:uppercase;margin:0 0 8px;">Active Rooms</h3>
 <table>
   <thead><tr><th>Room ID</th><th>Clients</th></tr></thead>
   <tbody id="roomTable"><tr><td colspan="2" style="color:#8b949e;">No active rooms</td></tr></tbody>
 </table>
-
 <div class="status" id="status">● Connecting…</div>
 <p style="font-size:12px;color:#8b949e;margin-top:20px;">
   WebSocket endpoint: <code id="wsurl"></code> · Refreshes every 2s
 </p>
-
 <script>
 const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
 document.getElementById('wsurl').textContent = wsProto + '://' + location.host + '/ws';
-
 async function refresh() {
   const statusEl = document.getElementById('status');
   try {
@@ -261,14 +270,11 @@ async function refresh() {
     document.getElementById('rooms').textContent = d.room_count;
     document.getElementById('conns').textContent = d.total_conns;
     document.getElementById('msgs').textContent = d.total_messages;
-
     const tbody = document.getElementById('roomTable');
     if (d.rooms.length === 0) {
       tbody.innerHTML = '<tr><td colspan="2" style="color:#8b949e;">No active rooms</td></tr>';
     } else {
-      tbody.innerHTML = d.rooms.map(r =>
-        '<tr><td>' + r.id + '</td><td>' + r.clients + '</td></tr>'
-      ).join('');
+      tbody.innerHTML = d.rooms.map(r => '<tr><td>' + r.id + '</td><td>' + r.clients + '</td></tr>').join('');
     }
     statusEl.textContent = '● Live';
     statusEl.className = 'status';
@@ -277,7 +283,6 @@ async function refresh() {
     statusEl.className = 'status offline';
   }
 }
-
 refresh();
 setInterval(refresh, 2000);
 </script>
@@ -290,7 +295,10 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	port := os.Getenv("PORT")
+	port := os.Getenv("SUGA_PUBLIC_TARGET_PORT")
+	if port == "" {
+		port = os.Getenv("PORT")
+	}
 	if port == "" {
 		port = "8080"
 	}
