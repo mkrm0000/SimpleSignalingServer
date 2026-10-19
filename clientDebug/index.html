@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Signaling Tester</title>
+  <style>
+    body { font-family: monospace; margin: 20px; }
+    #log { background: #111; color: #0f0; padding: 10px; height: 300px;
+           overflow-y: auto; white-space: pre-wrap; }
+    input, button { font-family: monospace; padding: 4px; }
+    .sent { color: #ff0; }
+    .recv { color: #0ff; }
+    .err  { color: #f00; }
+  </style>
+</head>
+<body>
+  <h3>WebRTC Signaling Tester</h3>
+  <div>
+    Server: <input id="url" size="40" value="ws://localhost:8080/ws">
+    Room:   <input id="room" size="15" value="paint_123">
+    <button id="connect">Connect &amp; Join</button>
+    <button id="disconnect">Disconnect</button>
+  </div>
+  <p>
+    <button id="sendOffer">Send fake offer</button>
+    <button id="sendIce">Send fake ICE</button>
+    <button id="sendAnswer">Send fake answer</button>
+  </p>
+  <div id="log"></div>
+
+<script>
+let ws = null;
+const logEl = document.getElementById('log');
+
+function log(msg, cls = '') {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+document.getElementById('connect').onclick = () => {
+  const url = document.getElementById('url').value.trim();
+  const room = document.getElementById('room').value.trim();
+  if (!url || !room) return log('Need URL and room', 'err');
+
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    log('WS open', 'recv');
+    ws.send(JSON.stringify({ type: 'join', room }));
+    log(`Sent join -> ${room}`, 'sent');
+  };
+
+  ws.onmessage = (ev) => {
+    log('RECV: ' + ev.data, 'recv');
+  };
+
+  ws.onerror = () => log('WS error', 'err');
+
+  ws.onclose = (ev) => log(`WS closed (code=${ev.code})`, 'err');
+};
+
+document.getElementById('disconnect').onclick = () => {
+  if (ws) { ws.close(); ws = null; log('Closed by user'); }
+};
+
+function send(type, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return log('Not connected', 'err');
+  const room = document.getElementById('room').value.trim();
+  const msg = { type, room, payload };
+  ws.send(JSON.stringify(msg));
+  log('SENT: ' + JSON.stringify(msg), 'sent');
+}
+
+document.getElementById('sendOffer').onclick  = () => send('offer',  { sdp: 'fake-offer-sdp' });
+document.getElementById('sendAnswer').onclick = () => send('answer', { sdp: 'fake-answer-sdp' });
+document.getElementById('sendIce').onclick    = () => send('ice',    { candidate: 'fake-candidate' });
+</script>
+</body>
+</html>
